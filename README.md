@@ -16,6 +16,7 @@ Model API searches for additional information required for model inference, data
 - Clone this repository
 - Navigate to `model_api/python` folder
 - Run `pip install .`
+
 ### C++
 - Install dependencies. For installation on Ubuntu, you can use the following script:
   ```bash
