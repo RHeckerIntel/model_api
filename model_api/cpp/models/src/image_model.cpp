@@ -134,6 +134,7 @@ ImageModel::ImageModel(std::shared_ptr<ov::Model>& model, const ov::AnyMap& conf
             }
         }
     } else {
+        // TODO: wrong iter?
         scale_values = labels_iter->second.as<std::vector<float>>();
     }
 }

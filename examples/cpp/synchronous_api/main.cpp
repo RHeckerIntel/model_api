@@ -14,6 +14,9 @@
 // limitations under the License.
 */
 
+#include "adapters/openvino_adapter.h"
+#include "utils/ocv_common.hpp"
+#include <openvino/runtime/core.hpp>
 #include <stddef.h>
 
 #include <cstdint>
@@ -29,9 +32,96 @@
 #include <openvino/openvino.hpp>
 
 #include <models/detection_model.h>
+#include <models/image_encodings_model.h>
 #include <models/input_data.h>
 #include <models/results.h>
+#include <adapters/inference_adapter.h>
 
+
+std::shared_ptr<ov::Model> embedProcessing(std::shared_ptr<ov::Model>& model,
+                                            const std::string& inputName,
+                                            const ov::Layout& layout,
+                                            const RESIZE_MODE resize_mode,
+                                            const cv::InterpolationFlags interpolationMode,
+                                            const ov::Shape& targetShape,
+                                            uint8_t pad_value,
+                                            bool brg2rgb,
+                                            const std::vector<float>& mean,
+                                            const std::vector<float>& scale,
+                                            const std::type_info& dtype) {
+    ov::preprocess::PrePostProcessor ppp(model);
+
+    // Change the input type to the 8-bit image
+    if (dtype == typeid(int)) {
+        ppp.input(inputName).tensor().set_element_type(ov::element::u8);
+    }
+
+    ppp.input(inputName).tensor().set_layout(ov::Layout("NHWC")).set_color_format(
+        ov::preprocess::ColorFormat::BGR
+    );
+
+    if (resize_mode != NO_RESIZE) {
+        ppp.input(inputName).tensor().set_spatial_dynamic_shape();
+        // Doing resize in u8 is more efficient than FP32 but can lead to slightly different results
+        ppp.input(inputName).preprocess().custom(
+            createResizeGraph(resize_mode, targetShape, interpolationMode, pad_value));
+    }
+
+    ppp.input(inputName).model().set_layout(ov::Layout(layout));
+
+    // Handle color format
+    if (brg2rgb) {
+        ppp.input(inputName).preprocess().convert_color(ov::preprocess::ColorFormat::RGB);
+    }
+
+    ppp.input(inputName).preprocess().convert_element_type(ov::element::f32);
+
+    if (!mean.empty()) {
+        ppp.input(inputName).preprocess().mean(mean);
+    }
+    if (!scale.empty()) {
+        ppp.input(inputName).preprocess().scale(scale);
+    }
+
+    return ppp.build();
+}
+
+
+void encoderPOC(std::string modelPath, cv::Mat image){
+    if (!image.data) {
+        throw std::runtime_error{"Failed to read the image"};
+    }
+
+    std::string device = "AUTO";
+
+
+    ov::Core core;
+    auto ov_encoder_model = core.read_model(modelPath);
+    //auto model = compiled_model.get_runtime_model();
+    std::vector<float> mean = {58.395, 57.12, 57.375};
+    std::vector<float> scale = { 123.675, 116.28, 103.53};
+    // ----------------------------------- attempt using prepostprocessor
+    auto embedding_processing_model = embedProcessing(ov_encoder_model, "input.1", "NCHW", RESIZE_FILL, cv::INTER_LINEAR, ov::Shape{1024, 1024}, 0, true, mean, scale, typeid(ov::element::f32));
+    //std::shared_ptr<ov::Model>
+    ov::preprocess::PrePostProcessor ppp = ov::preprocess::PrePostProcessor(embedding_processing_model);
+    ppp.output().model().set_layout(getLayoutFromShape(ov_encoder_model->output().get_partial_shape()));
+    ppp.output().tensor().set_element_type(ov::element::f32).set_layout("NCHW");
+    embedding_processing_model = ppp.build();
+
+    auto inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
+    inferenceAdapter->loadModel(embedding_processing_model, core, device);
+
+    image.convertTo(image, CV_32F);
+    InputTransform transform(true, "123.675 116.28 103.53","58.395 57.12 57.375");
+
+    cv::resize(image, image, cv::Size(1024, 1024));
+
+    InferenceInput inputs;
+    InferenceResult result;
+    inputs.emplace("input.1",wrapMat2Tensor(image));
+    result.outputsData = inferenceAdapter->infer(inputs);
+    std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
+}
 
 int main(int argc, char* argv[]) {
     try {
@@ -46,19 +136,16 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error{"Failed to read the image"};
         }
 
-        // Instantiate Object Detection model
-        auto model = DetectionModel::create_model(argv[1]); // works with SSD models. Download it using Python Model API
+        //encoderPOC(argv[1], image);
 
-        // Run the inference
+        auto model = ImageEncodingsModel::create_model(argv[1]);
         auto result = model->infer(image);
+        std::cout << result->getFirstOutputTensor().get_shape() << std::endl;
 
-        // Process detections
-        for (auto& obj : result->objects) {
-        std::cout << " " << std::left << std::setw(9) << obj.label << " | " << std::setw(10) << obj.confidence
-                    << " | " << std::setw(4) << int(obj.x) << " | " << std::setw(4) << int(obj.y) << " | "
-                    << std::setw(4) << int(obj.x + obj.width) << " | " << std::setw(4) << int(obj.y + obj.height)
-                    << std::endl;
-        }
+
+        //embedding_processing_model
+        // -----------------------------------
+        //cv::imwrite("/data/preprocessed.png", transform(image));
 
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;
