@@ -16,6 +16,10 @@
 
 #include "adapters/openvino_adapter.h"
 #include "utils/ocv_common.hpp"
+#include <cmath>
+#include <memory>
+#include <opencv2/core/cvdef.h>
+#include <opencv2/core/persistence.hpp>
 #include <openvino/runtime/core.hpp>
 #include <stddef.h>
 
@@ -37,91 +41,109 @@
 #include <models/results.h>
 #include <adapters/inference_adapter.h>
 
+struct PointsInput {
+    std::vector<float> point_coords;
+    std::vector<float> labels;
+};
 
-std::shared_ptr<ov::Model> embedProcessing(std::shared_ptr<ov::Model>& model,
-                                            const std::string& inputName,
-                                            const ov::Layout& layout,
-                                            const RESIZE_MODE resize_mode,
-                                            const cv::InterpolationFlags interpolationMode,
-                                            const ov::Shape& targetShape,
-                                            uint8_t pad_value,
-                                            bool brg2rgb,
-                                            const std::vector<float>& mean,
-                                            const std::vector<float>& scale,
-                                            const std::type_info& dtype) {
-    ov::preprocess::PrePostProcessor ppp(model);
 
-    // Change the input type to the 8-bit image
-    if (dtype == typeid(int)) {
-        ppp.input(inputName).tensor().set_element_type(ov::element::u8);
+struct InteractivePoint: public cv::Point {
+    InteractivePoint(int x, int y, bool positive): cv::Point(x, y), positive(positive) {}
+    bool positive;
+};
+
+std::vector<InteractivePoint> points = {};
+cv::Mat image;
+cv::Size inputSize(1024, 1024);
+ov::Tensor image_embeddings_tensor;
+
+
+PointsInput buildPointCoords() {
+    struct PointsInput input;
+    for (auto &point: points) {
+        input.point_coords.emplace_back(point.x);
+        input.point_coords.emplace_back(point.y);
+        input.labels.emplace_back(point.positive);
     }
 
-    ppp.input(inputName).tensor().set_layout(ov::Layout("NHWC")).set_color_format(
-        ov::preprocess::ColorFormat::BGR
-    );
+    // no boxes yet...
+    input.point_coords.emplace_back(0);
+    input.point_coords.emplace_back(0);
+    input.labels.emplace_back(-1);
 
-    if (resize_mode != NO_RESIZE) {
-        ppp.input(inputName).tensor().set_spatial_dynamic_shape();
-        // Doing resize in u8 is more efficient than FP32 but can lead to slightly different results
-        ppp.input(inputName).preprocess().custom(
-            createResizeGraph(resize_mode, targetShape, interpolationMode, pad_value));
-    }
-
-    ppp.input(inputName).model().set_layout(ov::Layout(layout));
-
-    // Handle color format
-    if (brg2rgb) {
-        ppp.input(inputName).preprocess().convert_color(ov::preprocess::ColorFormat::RGB);
-    }
-
-    ppp.input(inputName).preprocess().convert_element_type(ov::element::f32);
-
-    if (!mean.empty()) {
-        ppp.input(inputName).preprocess().mean(mean);
-    }
-    if (!scale.empty()) {
-        ppp.input(inputName).preprocess().scale(scale);
-    }
-
-    return ppp.build();
+    return input;
 }
 
-
-void encoderPOC(std::string modelPath, cv::Mat image){
-    if (!image.data) {
-        throw std::runtime_error{"Failed to read the image"};
-    }
-
+void runMask() {
     std::string device = "AUTO";
 
 
     ov::Core core;
-    auto ov_encoder_model = core.read_model(modelPath);
-    //auto model = compiled_model.get_runtime_model();
-    std::vector<float> mean = {58.395, 57.12, 57.375};
-    std::vector<float> scale = { 123.675, 116.28, 103.53};
-    // ----------------------------------- attempt using prepostprocessor
-    auto embedding_processing_model = embedProcessing(ov_encoder_model, "input.1", "NCHW", RESIZE_FILL, cv::INTER_LINEAR, ov::Shape{1024, 1024}, 0, true, mean, scale, typeid(ov::element::f32));
-    //std::shared_ptr<ov::Model>
-    ov::preprocess::PrePostProcessor ppp = ov::preprocess::PrePostProcessor(embedding_processing_model);
-    ppp.output().model().set_layout(getLayoutFromShape(ov_encoder_model->output().get_partial_shape()));
-    ppp.output().tensor().set_element_type(ov::element::f32).set_layout("NCHW");
-    embedding_processing_model = ppp.build();
-
+    auto model = core.read_model("/data/sam/sam_mask_predictor.xml");
     auto inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
-    inferenceAdapter->loadModel(embedding_processing_model, core, device);
+    inferenceAdapter->loadModel(model, core, device);
 
-    image.convertTo(image, CV_32F);
-    InputTransform transform(true, "123.675 116.28 103.53","58.395 57.12 57.375");
+    auto inputNames = inferenceAdapter->getInputNames();
 
-    cv::resize(image, image, cv::Size(1024, 1024));
+    for (auto name: inputNames) {
+            std::cout << name << std::endl;
+            std::cout << inferenceAdapter->getInputShape(name) << std::endl;
+    }
+
+    auto point_data = buildPointCoords();
+    ov::Tensor point_coords(ov::element::f32, ov::Shape{1, point_data.point_coords.size() / 2, 2}, point_data.point_coords.data());
+    ov::Tensor point_labels(ov::element::f32, ov::Shape{1, point_data.labels.size()}, point_data.labels.data());
+
+    std::cout << "running mask..." << std::endl;
 
     InferenceInput inputs;
     InferenceResult result;
-    inputs.emplace("input.1",wrapMat2Tensor(image));
+    inputs.emplace("image_embeddings", image_embeddings_tensor);
+    inputs.emplace("point_coords", point_coords);
+    inputs.emplace("point_labels", point_labels);
+    for (auto &input: inputs) {
+        std::cout << input.first << ":" << input.second.get_shape() << std::endl;
+    }
     result.outputsData = inferenceAdapter->infer(inputs);
-    std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
+
+    auto outputNames = inferenceAdapter->getOutputNames();
+
+    auto mask_tensor = result.outputsData["masks"];
+    std::cout << mask_tensor.get_shape() << std::endl;
+
+    cv::Mat predictions(1024, 1024, CV_32FC1, mask_tensor.data<float_t>());
+    cv::imshow("predictions", predictions);
+    // TODO: What the hell is happening to my tensor after one click. And how should I interpret the result? Postprocessing?
+    //for (auto name: outputNames) {
+    //        std::cout << name << std::endl;
+    //        std::cout << result.outputsData[name].get_shape() << std::endl;
+    //        //std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
+    //}
+
+    //std::cout << result.outputsData["mask"].get_shape() << std::endl;
+
+    //auto embedding_processing_model = embedProcessing(ov_encoder_model, "input.1", "NCHW", RESIZE_FILL, cv::INTER_LINEAR, ov::Shape{1024, 1024}, 0, true, mean, scale, typeid(ov::element::f32));
 }
+
+
+static void onMouse( int event, int x, int y, int, void* )
+{
+    if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_RBUTTONDOWN))
+        return;
+
+
+    bool positive = event == cv::EVENT_LBUTTONDOWN;
+    std::cout << x <<  ":" << y << std::endl;
+
+    points.emplace_back(x, y, positive);
+
+    cv::Scalar color(0, positive ? 255 : 0, positive ? 0 : 255, 0);
+
+    cv::circle(image, {x, y}, 3, color);
+    cv::imshow("image", image);
+    runMask();
+}
+
 
 int main(int argc, char* argv[]) {
     try {
@@ -131,17 +153,47 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
 
-        cv::Mat image = cv::imread(argv[2]);
+        image = cv::imread(argv[2]);
         if (!image.data) {
             throw std::runtime_error{"Failed to read the image"};
         }
 
-        //encoderPOC(argv[1], image);
+        std::cout << points.size() << std::endl;
+
+        cv::Vec2f rescale(inputSize.width / (float)image.cols, inputSize.height / (float)image.rows);
+
+        cv::resize(image, image, inputSize);
+
 
         auto model = ImageEncodingsModel::create_model(argv[1]);
         auto result = model->infer(image);
-        std::cout << result->getFirstOutputTensor().get_shape() << std::endl;
+        image_embeddings_tensor = result->getFirstOutputTensor();
 
+        cv::namedWindow( "image", 0);
+        cv::imshow( "image", image);
+        cv::setMouseCallback( "image", onMouse, 0 );
+
+        //runMask();
+
+        cv:: waitKey( 0 );
+
+
+
+        //encoderPOC(argv[1], image);
+
+        //std::cout << image_embeddings_tensor.get_element_type() << std::endl;
+        //int shape[4] = { 1, 256, 64, 64};
+        //cv::Mat image_embeddings_mat(4, shape, CV_32F, image_embeddings_tensor.data<float>());
+
+        //std::cout << image_embeddings_mat.size << std::endl;
+
+        //if (outChannels == 1 && outTensor.get_element_type() == ov::element::i32) {
+        //cv::Mat image_embeddings_mat(4, CV_32SC1, outTensor.data<int32_t>());
+
+        //cv::FileStorage file("/data/sam/cattle_encodings.ext", cv::FileStorage::WRITE);
+        //file << "cattle_encodings" << image_embeddings_mat;
+
+        //file.release();
 
         //embedding_processing_model
         // -----------------------------------
