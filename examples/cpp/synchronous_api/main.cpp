@@ -46,13 +46,13 @@ struct PointsInput {
     std::vector<float> labels;
 };
 
-
 struct InteractivePoint: public cv::Point {
     InteractivePoint(int x, int y, bool positive): cv::Point(x, y), positive(positive) {}
     bool positive;
 };
 
 std::vector<InteractivePoint> points = {};
+std::vector<cv::Rect> boxes = {};
 cv::Mat image;
 cv::Size inputSize(1024, 1024);
 ov::Tensor image_embeddings_tensor;
@@ -67,9 +67,32 @@ PointsInput buildPointCoords() {
     }
 
     // no boxes yet...
-    input.point_coords.emplace_back(0);
-    input.point_coords.emplace_back(0);
-    input.labels.emplace_back(-1);
+    if (boxes.size() == 0) {
+        input.point_coords.emplace_back(0);
+        input.point_coords.emplace_back(0);
+        input.labels.emplace_back(-1);
+    } else {
+        for (auto &box: boxes) {
+            input.point_coords.emplace_back(box.tl().x);
+            input.point_coords.emplace_back(box.tl().y);
+            input.labels.emplace_back(2);
+            input.point_coords.emplace_back(box.br().x);
+            input.point_coords.emplace_back(box.br().y);
+            input.labels.emplace_back(3);
+        }
+    }
+
+    std::cout << "point coords: ";
+    for (auto v: input.point_coords) {
+        std::cout << v << ", ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "labels: ";
+    for (auto v: input.labels) {
+        std::cout << v << ", ";
+    }
+    std::cout << std::endl;
 
     return input;
 }
@@ -113,36 +136,67 @@ void runMask() {
 
     cv::Mat predictions(1024, 1024, CV_32FC1, mask_tensor.data<float_t>());
     cv::imshow("predictions", predictions);
-    // TODO: What the hell is happening to my tensor after one click. And how should I interpret the result? Postprocessing?
-    //for (auto name: outputNames) {
-    //        std::cout << name << std::endl;
-    //        std::cout << result.outputsData[name].get_shape() << std::endl;
-    //        //std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
-    //}
+    for (auto name: outputNames) {
+            std::cout << name << std::endl;
+            std::cout << result.outputsData[name].get_shape() << std::endl;
+            //std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
+    }
+
+    float* iou_predictions = result.outputsData["iou_predictions"].data<float_t>();
+    std::cout << iou_predictions[0] << std::endl;
 
     //std::cout << result.outputsData["mask"].get_shape() << std::endl;
 
     //auto embedding_processing_model = embedProcessing(ov_encoder_model, "input.1", "NCHW", RESIZE_FILL, cv::INTER_LINEAR, ov::Shape{1024, 1024}, 0, true, mean, scale, typeid(ov::element::f32));
 }
 
+/*
+ *moreover, we identified and selected
+only stable masks (we consider a mask stable if thresholding the probability map at 0.5 − δ and 0.5 + δ results in
+similar masks). F
+ * */
+
+cv::Point pointDown;
+cv::Point pointUp;
+
+bool PointMode = false;
 
 static void onMouse( int event, int x, int y, int, void* )
 {
-    if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_RBUTTONDOWN))
-        return;
+    if (PointMode) {
+        if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_RBUTTONDOWN))
+            return;
+
+        bool positive = event == cv::EVENT_LBUTTONDOWN;
+        std::cout << x <<  ":" << y << std::endl;
+
+        points.emplace_back(x, y, positive);
+
+        cv::Scalar color(0, positive ? 255 : 0, positive ? 0 : 255, 0);
+
+        cv::circle(image, {x, y}, 3, color);
+        cv::imshow("image", image);
+        runMask();
+    } else {
+        if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_LBUTTONUP))
+            return;
+
+        if (event == cv::EVENT_LBUTTONDOWN) {
+            pointDown = cv::Point(x, y);
+        } else {
+            pointUp = cv::Point(x, y);
+
+            cv::Rect box(pointDown, pointUp);
+            boxes.push_back(box);
+            cv::rectangle(image, box, 255);
+            cv::imshow("image", image);
+            runMask();
+        }
 
 
-    bool positive = event == cv::EVENT_LBUTTONDOWN;
-    std::cout << x <<  ":" << y << std::endl;
-
-    points.emplace_back(x, y, positive);
-
-    cv::Scalar color(0, positive ? 255 : 0, positive ? 0 : 255, 0);
-
-    cv::circle(image, {x, y}, 3, color);
-    cv::imshow("image", image);
-    runMask();
+    }
 }
+
 
 
 int main(int argc, char* argv[]) {
