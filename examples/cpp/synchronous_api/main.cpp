@@ -72,7 +72,7 @@ void drawContours(Contours contours) {
     }
 
     for (auto rect: boxes) {
-        cv::rectangle(outputImage, rect, 255, -1);
+        cv::rectangle(outputImage, rect, 255, 1);
     }
 
     cv::drawContours(outputImage, contours, -1, 255);
@@ -139,7 +139,7 @@ class MaskPredictor {
 public:
     std::string device = "AUTO";
     ov::Core core;
-    float stability_threshold = 0.9f;
+    float stability_threshold = 0.90f;
     std::shared_ptr<InferenceAdapter> inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
 
     MaskPredictor() {}
@@ -163,6 +163,7 @@ public:
             cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
             //cv::threshold(new_mask, new_mask, 0.5, 1, cv::THRESH_BINARY);
             if (calculateStabilityScore(new_mask) > stability_threshold) {
+                cv::imshow("debug", new_mask);
                 new_mask.convertTo(new_mask, CV_8UC1, 255);
                 combineNewMask(masks, new_mask);
             }
@@ -175,8 +176,37 @@ public:
         return getContours(masks);
     }
 
-    Contours batchRunMask(std::vector<InteractivePoint> &points, std::vector<cv::Rect> boxes, int batchSize) {
+    Contours batchRunMaskBoxes(std::vector<cv::Rect> boxes, int batchSize) {
         std::vector<cv::Mat> masks = {};
+        std::vector<InteractivePoint> points = {};
+
+        auto batches = batchVector<cv::Rect>(boxes, batchSize);
+        for (size_t i = 0; i < batches.size(); i++ ) {
+            std::cout << "Batch " << i << "/" << batches.size() << std::endl;
+            auto point_data = buildPointCoords(points, batches[i]);
+            ov::Tensor point_coords(ov::element::f32, ov::Shape{point_data.point_coords.size() / 4, 2, 2}, point_data.point_coords.data());
+            ov::Tensor point_labels(ov::element::f32, ov::Shape{point_data.labels.size() / 2, 2}, point_data.labels.data());
+            auto mask_tensor = infer(point_coords, point_labels);
+
+            int batchSize = mask_tensor.get_shape()[0];
+            int stride = mask_tensor.get_strides()[0];
+
+            for (int i = 0; i < batchSize; i++) {
+                cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
+                if (calculateStabilityScore(new_mask) > stability_threshold) {
+                    new_mask.convertTo(new_mask, CV_8UC1, 255);
+                    combineNewMask(masks, new_mask);
+                }
+            }
+        }
+
+        std::cout << "masks found: " << masks.size() << std::endl;
+        return getContours(masks);
+    }
+
+    Contours batchRunMaskPoints(std::vector<InteractivePoint> &points, int batchSize) {
+        std::vector<cv::Mat> masks = {};
+        std::vector<cv::Rect> boxes = {};
 
         auto batches = batchVector<InteractivePoint>(points, batchSize);
         for (size_t i = 0; i < batches.size(); i++ ) {
@@ -201,6 +231,7 @@ public:
         std::cout << "masks found: " << masks.size() << std::endl;
         return getContours(masks);
     }
+
 
     ov::Tensor infer(ov::Tensor point_coords, ov::Tensor point_labels) {
         InferenceInput inputs;
@@ -259,13 +290,9 @@ similar masks). F
 cv::Point pointDown;
 cv::Point pointUp;
 
-bool PointMode = true;
-
 static void onMouse( int event, int x, int y, int, void* )
 {
-    if (PointMode) {
-        if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_RBUTTONDOWN))
-            return;
+    if(event == cv::EVENT_LBUTTONDOWN) {
 
         points = {};
         bool positive = event == cv::EVENT_LBUTTONDOWN;
@@ -274,11 +301,13 @@ static void onMouse( int event, int x, int y, int, void* )
 
         drawContours(maskPredictor.runMask(points,boxes));
 
-    } else {
-        if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_LBUTTONUP))
+    }
+
+    if(event == cv::EVENT_RBUTTONDOWN || event == cv::EVENT_RBUTTONUP) {
+        if(!(event == cv::EVENT_RBUTTONDOWN || event == cv::EVENT_RBUTTONUP))
             return;
 
-        if (event == cv::EVENT_LBUTTONDOWN) {
+        if (event == cv::EVENT_RBUTTONDOWN) {
             pointDown = cv::Point(x, y);
         } else {
             pointUp = cv::Point(x, y);
@@ -293,29 +322,33 @@ static void onMouse( int event, int x, int y, int, void* )
     }
 }
 
-void segment_all() {
-    float n = 40;
+void segment_all(bool pointMode = true) {
+    float n = 32;
     cv::Point template_size(inputSize.width / n, inputSize.height / n);
+
+    std::cout << template_size << std::endl;
 
     cv::Point grid_point;
     image.copyTo(outputImage);
     points = {};
     boxes = {};
-    if (PointMode) {
+    if (pointMode) {
         for (grid_point.y = template_size.y / 2; grid_point.y < inputSize.height; grid_point.y += template_size.y){
             for (grid_point.x = template_size.x / 2; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
                 points.emplace_back(grid_point.x, grid_point.y, true);
             }
         }
+        auto contours = maskPredictor.batchRunMaskPoints(points, 64);
+        drawContours(contours);
     } else {
         for (grid_point.y = 0; grid_point.y < inputSize.height; grid_point.y += template_size.y){
             for (grid_point.x = 0; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
                 boxes.emplace_back(grid_point, grid_point + template_size);
             }
         }
+        auto contours = maskPredictor.batchRunMaskBoxes(boxes, 32);
+        drawContours(contours);
     }
-    auto contours = maskPredictor.batchRunMask(points, boxes, 20);
-    drawContours(contours);
 }
 
 int main(int argc, char* argv[]) {
@@ -345,7 +378,7 @@ int main(int argc, char* argv[]) {
         cv::setMouseCallback( "image", onMouse, 0 );
 
         maskPredictor = MaskPredictor("/data/sam/sam_mask_predictor.xml");
-        segment_all();
+        //segment_all();
         cv:: waitKey( 0 );
 
     } catch (const std::exception& error) {
