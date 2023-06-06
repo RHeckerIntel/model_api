@@ -16,9 +16,11 @@
 
 #include "adapters/openvino_adapter.h"
 #include "utils/ocv_common.hpp"
+#include <chrono>
 #include <cmath>
 #include <memory>
 #include <opencv2/core/cvdef.h>
+#include <opencv2/core/hal/interface.h>
 #include <opencv2/core/persistence.hpp>
 #include <openvino/runtime/core.hpp>
 #include <stddef.h>
@@ -46,6 +48,8 @@ struct PointsInput {
     std::vector<float> labels;
 };
 
+using Contours = std::vector<std::vector<cv::Point>>;
+
 struct InteractivePoint: public cv::Point {
     InteractivePoint(int x, int y, bool positive): cv::Point(x, y), positive(positive) {}
     bool positive;
@@ -54,11 +58,62 @@ struct InteractivePoint: public cv::Point {
 std::vector<InteractivePoint> points = {};
 std::vector<cv::Rect> boxes = {};
 cv::Mat image;
+cv::Mat outputImage;
 cv::Size inputSize(1024, 1024);
 ov::Tensor image_embeddings_tensor;
 
 
-PointsInput buildPointCoords() {
+std::vector<cv::Point> findBiggestContour(cv::Mat mat) {
+    std::vector<std::vector<cv::Point>> contours;
+    std::vector<cv::Vec4i> hierarchies;
+    cv::findContours(mat, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+
+    float highestContourArea = 0;
+    int highestContourIndex = 0;
+    for (size_t i = 0; i < contours.size(); i++) {
+        if (highestContourArea < cv::contourArea(contours[i])) {
+            highestContourIndex = i;
+        }
+    }
+
+    return contours[highestContourIndex];
+}
+
+
+void drawContours(Contours contours) {
+    outputImage = cv::Mat(1024, 1024, CV_32FC1);
+    image.copyTo(outputImage);
+    cv::drawContours(outputImage, contours, -1, 255);
+    cv::imwrite("/data/sam_output.png", outputImage);
+    cv::imshow("image", outputImage);
+}
+
+struct IOUResult {
+    float iou;
+    std::vector<cv::Point> contour;
+};
+
+IOUResult polygonIOU(std::vector<std::vector<cv::Point>> &contours, int indexA, int indexB) {
+    std::cout << "Comparing: " << indexA << ":" << indexB << std::endl;
+
+    cv::Mat matA = cv::Mat::zeros(inputSize, CV_8UC1);
+    cv::Mat matB = cv::Mat::zeros(inputSize, CV_8UC1);
+
+    cv::Mat intersectionMat(inputSize, CV_8UC1);
+    cv::Mat unionMat(inputSize, CV_8UC1);
+
+    cv::drawContours(matA, contours, indexA, 1, -1);
+    cv::drawContours(matB, contours, indexB, 1, -1);
+
+    intersectionMat = matA.mul(matB);
+    unionMat = matA + matB;
+
+
+
+    return { cv::countNonZero(intersectionMat) / (float)cv::countNonZero(unionMat), findBiggestContour(unionMat) };
+}
+
+PointsInput buildPointCoords(std::vector<InteractivePoint> &points, std::vector<cv::Rect> &boxes, bool batch = false) {
     struct PointsInput input;
     for (auto &point: points) {
         input.point_coords.emplace_back(point.x);
@@ -66,7 +121,10 @@ PointsInput buildPointCoords() {
         input.labels.emplace_back(point.positive);
     }
 
-    // no boxes yet...
+    if (batch) {
+        return input;
+    }
+
     if (boxes.size() == 0) {
         input.point_coords.emplace_back(0);
         input.point_coords.emplace_back(0);
@@ -81,74 +139,113 @@ PointsInput buildPointCoords() {
             input.labels.emplace_back(3);
         }
     }
-
-    std::cout << "point coords: ";
-    for (auto v: input.point_coords) {
-        std::cout << v << ", ";
-    }
-    std::cout << std::endl;
-
-    std::cout << "labels: ";
-    for (auto v: input.labels) {
-        std::cout << v << ", ";
-    }
-    std::cout << std::endl;
-
     return input;
 }
 
-void runMask() {
+class MaskPredictor {
+public:
     std::string device = "AUTO";
-
-
     ov::Core core;
-    auto model = core.read_model("/data/sam/sam_mask_predictor.xml");
-    auto inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
-    inferenceAdapter->loadModel(model, core, device);
+    std::shared_ptr<InferenceAdapter> inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
 
-    auto inputNames = inferenceAdapter->getInputNames();
-
-    for (auto name: inputNames) {
-            std::cout << name << std::endl;
-            std::cout << inferenceAdapter->getInputShape(name) << std::endl;
+    MaskPredictor() {}
+    MaskPredictor(std::string model_file) {
+        auto model = core.read_model(model_file);
+        inferenceAdapter->loadModel(model, core, device);
     }
 
-    auto point_data = buildPointCoords();
-    ov::Tensor point_coords(ov::element::f32, ov::Shape{1, point_data.point_coords.size() / 2, 2}, point_data.point_coords.data());
-    ov::Tensor point_labels(ov::element::f32, ov::Shape{1, point_data.labels.size()}, point_data.labels.data());
+    Contours runMask(std::vector<InteractivePoint> &points, std::vector<cv::Rect> &boxes) {
+        auto point_data = buildPointCoords(points, boxes);
+        ov::Tensor point_coords(ov::element::f32, ov::Shape{1, point_data.point_coords.size() / 2, 2}, point_data.point_coords.data());
+        ov::Tensor point_labels(ov::element::f32, ov::Shape{1, point_data.labels.size()}, point_data.labels.data());
+        auto mask_tensor = infer(point_coords, point_labels);
 
-    std::cout << "running mask..." << std::endl;
+        int batchSize = mask_tensor.get_shape()[0];
+        int stride = mask_tensor.get_strides()[0];
 
-    InferenceInput inputs;
-    InferenceResult result;
-    inputs.emplace("image_embeddings", image_embeddings_tensor);
-    inputs.emplace("point_coords", point_coords);
-    inputs.emplace("point_labels", point_labels);
-    for (auto &input: inputs) {
-        std::cout << input.first << ":" << input.second.get_shape() << std::endl;
-    }
-    result.outputsData = inferenceAdapter->infer(inputs);
+        std::vector<cv::Mat> masks = {};
+        for (int i = 0; i < batchSize; i++) {
+            cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
+            new_mask.convertTo(new_mask, CV_8UC1, 255);
+            combineNewMask(masks, new_mask);
+        }
 
-    auto outputNames = inferenceAdapter->getOutputNames();
 
-    auto mask_tensor = result.outputsData["masks"];
-    std::cout << mask_tensor.get_shape() << std::endl;
-
-    cv::Mat predictions(1024, 1024, CV_32FC1, mask_tensor.data<float_t>());
-    cv::imshow("predictions", predictions);
-    for (auto name: outputNames) {
-            std::cout << name << std::endl;
-            std::cout << result.outputsData[name].get_shape() << std::endl;
-            //std::cout << result.getFirstOutputTensor().get_shape() << std::endl;
+        return getContours(masks);
     }
 
-    float* iou_predictions = result.outputsData["iou_predictions"].data<float_t>();
-    std::cout << iou_predictions[0] << std::endl;
+    Contours batchRunMask(std::vector<InteractivePoint> &points, int batchSize) {
+        std::vector<cv::Rect> boxes = {};
+        std::vector<cv::Mat> masks = {};
+        for (size_t i = 0; i < points.size() / batchSize; i++ ) {
+            std::cout << "Batch " << i << "/" << points.size() / batchSize << std::endl;
+            std::vector<InteractivePoint> batch;
+            auto start = points.begin() + i * batchSize;
+            int endIndex = std::min<int>((i + 1) * batchSize, points.size());
 
-    //std::cout << result.outputsData["mask"].get_shape() << std::endl;
+            auto end = points.begin() + endIndex;
+            batch.insert(batch.begin(), start, end);
 
-    //auto embedding_processing_model = embedProcessing(ov_encoder_model, "input.1", "NCHW", RESIZE_FILL, cv::INTER_LINEAR, ov::Shape{1024, 1024}, 0, true, mean, scale, typeid(ov::element::f32));
-}
+            auto point_data = buildPointCoords(batch, boxes, true);
+            ov::Tensor point_coords(ov::element::f32, ov::Shape{point_data.point_coords.size() / 2, 1, 2}, point_data.point_coords.data());
+            ov::Tensor point_labels(ov::element::f32, ov::Shape{point_data.labels.size(), 1}, point_data.labels.data());
+            auto mask_tensor = infer(point_coords, point_labels);
+
+            int batchSize = mask_tensor.get_shape()[0];
+            int stride = mask_tensor.get_strides()[0];
+
+            for (int i = 0; i < batchSize; i++) {
+                cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
+                new_mask.convertTo(new_mask, CV_8UC1, 255);
+                combineNewMask(masks, new_mask);
+            }
+        }
+        return getContours(masks);
+
+        //return infer(point_coords, point_labels);
+    }
+
+    ov::Tensor infer(ov::Tensor point_coords, ov::Tensor point_labels) {
+        InferenceInput inputs;
+        InferenceResult result;
+        inputs.emplace("image_embeddings", image_embeddings_tensor);
+        inputs.emplace("point_coords", point_coords);
+        inputs.emplace("point_labels", point_labels);
+        auto start = std::chrono::high_resolution_clock::now();
+        result.outputsData = inferenceAdapter->infer(inputs);
+        auto end = std::chrono::high_resolution_clock::now();
+        std::cout << "time: " <<  std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) << std::endl;
+
+        return result.outputsData["masks"];
+    }
+
+    void combineNewMask(std::vector<cv::Mat> &saved_masks, cv::Mat mask) {
+        for (auto &saved_mask: saved_masks) {
+            cv::Mat intersectionMat(inputSize, CV_8UC1);
+            cv::Mat unionMat(inputSize, CV_8UC1);
+            intersectionMat = mask.mul(saved_mask);
+            unionMat = saved_mask + mask;
+            float iou = cv::countNonZero(intersectionMat) / (float)cv::countNonZero(unionMat);
+            if (iou > 0.5f) {
+                unionMat.copyTo(saved_mask);
+                return;
+            }
+        }
+        saved_masks.push_back(mask);
+    }
+
+    std::vector<std::vector<cv::Point>> getContours(std::vector<cv::Mat> masks) {
+        std::vector<std::vector<cv::Point>> contours;
+        for (auto &mask: masks) {
+            contours.push_back(findBiggestContour(mask));
+        }
+
+        return contours;
+    }
+};
+
+MaskPredictor maskPredictor;
+
 
 /*
  *moreover, we identified and selected
@@ -159,24 +256,20 @@ similar masks). F
 cv::Point pointDown;
 cv::Point pointUp;
 
-bool PointMode = false;
-
+bool PointMode = true;
 static void onMouse( int event, int x, int y, int, void* )
 {
     if (PointMode) {
         if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_RBUTTONDOWN))
             return;
 
+        points = {};
         bool positive = event == cv::EVENT_LBUTTONDOWN;
         std::cout << x <<  ":" << y << std::endl;
-
         points.emplace_back(x, y, positive);
 
-        cv::Scalar color(0, positive ? 255 : 0, positive ? 0 : 255, 0);
+        drawContours(maskPredictor.runMask(points,boxes));
 
-        cv::circle(image, {x, y}, 3, color);
-        cv::imshow("image", image);
-        runMask();
     } else {
         if(!(event == cv::EVENT_LBUTTONDOWN || event == cv::EVENT_LBUTTONUP))
             return;
@@ -186,18 +279,28 @@ static void onMouse( int event, int x, int y, int, void* )
         } else {
             pointUp = cv::Point(x, y);
 
-            cv::Rect box(pointDown, pointUp);
-            boxes.push_back(box);
-            cv::rectangle(image, box, 255);
-            cv::imshow("image", image);
-            runMask();
+            drawContours(maskPredictor.runMask(points,boxes));
+
+
         }
-
-
     }
 }
 
+void segment_all() {
+    float n = 20;
+    cv::Point template_size(inputSize.width / n, inputSize.height / n);
 
+    cv::Point grid_point;
+    image.copyTo(outputImage);
+    points = {};
+    for (grid_point.y = template_size.y / 2; grid_point.y < inputSize.height; grid_point.y += template_size.y){
+        for (grid_point.x = template_size.x / 2; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
+            points.emplace_back(grid_point.x, grid_point.y, true);
+        }
+    }
+    auto contours = maskPredictor.batchRunMask(points, 20);
+    drawContours(contours);
+}
 
 int main(int argc, char* argv[]) {
     try {
@@ -212,12 +315,10 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error{"Failed to read the image"};
         }
 
-        std::cout << points.size() << std::endl;
-
         cv::Vec2f rescale(inputSize.width / (float)image.cols, inputSize.height / (float)image.rows);
+        outputImage = cv::Mat(1024, 1024, CV_32FC1);
 
         cv::resize(image, image, inputSize);
-
 
         auto model = ImageEncodingsModel::create_model(argv[1]);
         auto result = model->infer(image);
@@ -227,31 +328,10 @@ int main(int argc, char* argv[]) {
         cv::imshow( "image", image);
         cv::setMouseCallback( "image", onMouse, 0 );
 
-        //runMask();
 
+        maskPredictor = MaskPredictor("/data/sam/sam_mask_predictor.xml");
+        segment_all();
         cv:: waitKey( 0 );
-
-
-
-        //encoderPOC(argv[1], image);
-
-        //std::cout << image_embeddings_tensor.get_element_type() << std::endl;
-        //int shape[4] = { 1, 256, 64, 64};
-        //cv::Mat image_embeddings_mat(4, shape, CV_32F, image_embeddings_tensor.data<float>());
-
-        //std::cout << image_embeddings_mat.size << std::endl;
-
-        //if (outChannels == 1 && outTensor.get_element_type() == ov::element::i32) {
-        //cv::Mat image_embeddings_mat(4, CV_32SC1, outTensor.data<int32_t>());
-
-        //cv::FileStorage file("/data/sam/cattle_encodings.ext", cv::FileStorage::WRITE);
-        //file << "cattle_encodings" << image_embeddings_mat;
-
-        //file.release();
-
-        //embedding_processing_model
-        // -----------------------------------
-        //cv::imwrite("/data/preprocessed.png", transform(image));
 
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;
