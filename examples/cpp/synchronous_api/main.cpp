@@ -62,55 +62,22 @@ cv::Mat outputImage;
 cv::Size inputSize(1024, 1024);
 ov::Tensor image_embeddings_tensor;
 
-
-std::vector<cv::Point> findBiggestContour(cv::Mat mat) {
-    std::vector<std::vector<cv::Point>> contours;
-    std::vector<cv::Vec4i> hierarchies;
-    cv::findContours(mat, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-
-    float highestContourArea = 0;
-    int highestContourIndex = 0;
-    for (size_t i = 0; i < contours.size(); i++) {
-        if (highestContourArea < cv::contourArea(contours[i])) {
-            highestContourIndex = i;
-        }
-    }
-
-    return contours[highestContourIndex];
-}
-
-
 void drawContours(Contours contours) {
     outputImage = cv::Mat(1024, 1024, CV_32FC1);
     image.copyTo(outputImage);
+
+
+    for (auto point: points) {
+        cv::circle(outputImage, point, 2, 255, -1);
+    }
+
+    for (auto rect: boxes) {
+        cv::rectangle(outputImage, rect, 255, -1);
+    }
+
     cv::drawContours(outputImage, contours, -1, 255);
     cv::imwrite("/data/sam_output.png", outputImage);
     cv::imshow("image", outputImage);
-}
-
-struct IOUResult {
-    float iou;
-    std::vector<cv::Point> contour;
-};
-
-IOUResult polygonIOU(std::vector<std::vector<cv::Point>> &contours, int indexA, int indexB) {
-    std::cout << "Comparing: " << indexA << ":" << indexB << std::endl;
-
-    cv::Mat matA = cv::Mat::zeros(inputSize, CV_8UC1);
-    cv::Mat matB = cv::Mat::zeros(inputSize, CV_8UC1);
-
-    cv::Mat intersectionMat(inputSize, CV_8UC1);
-    cv::Mat unionMat(inputSize, CV_8UC1);
-
-    cv::drawContours(matA, contours, indexA, 1, -1);
-    cv::drawContours(matB, contours, indexB, 1, -1);
-
-    intersectionMat = matA.mul(matB);
-    unionMat = matA + matB;
-
-
-
-    return { cv::countNonZero(intersectionMat) / (float)cv::countNonZero(unionMat), findBiggestContour(unionMat) };
 }
 
 PointsInput buildPointCoords(std::vector<InteractivePoint> &points, std::vector<cv::Rect> &boxes, bool batch = false) {
@@ -142,10 +109,37 @@ PointsInput buildPointCoords(std::vector<InteractivePoint> &points, std::vector<
     return input;
 }
 
+template <typename T> std::vector<std::vector<T>> batchVector(std::vector<T> objects, int batchSize) {
+    std::vector<std::vector<T>> batches;
+    for (size_t i = 0; i < objects.size() / batchSize; i++ ) {
+        std::vector<T> batch;
+        auto start = objects.begin() + i * batchSize;
+        int endIndex = std::min<int>((i + 1) * batchSize, objects.size());
+        auto end = objects.begin() + endIndex;
+        batch.insert(batch.begin(), start, end);
+        batches.push_back(batch);
+    }
+    return batches;
+}
+
+float calculateStabilityScore(cv::Mat mask) {
+    float mask_threshold = 0;
+    float stability_score_offset = 1.0f;
+
+
+    cv::Mat unionMask;
+    cv::threshold(mask, unionMask, mask_threshold - stability_score_offset, 100.0f, cv::THRESH_BINARY);
+    cv::Mat intersectionMask;
+    cv::threshold(mask, intersectionMask, mask_threshold + stability_score_offset, 100.0f, cv::THRESH_BINARY);
+
+    return cv::countNonZero(intersectionMask) / (float)cv::countNonZero(unionMask);
+}
+
 class MaskPredictor {
 public:
     std::string device = "AUTO";
     ov::Core core;
+    float stability_threshold = 0.9f;
     std::shared_ptr<InferenceAdapter> inferenceAdapter = std::make_shared<OpenVINOInferenceAdapter>();
 
     MaskPredictor() {}
@@ -160,33 +154,34 @@ public:
         ov::Tensor point_labels(ov::element::f32, ov::Shape{1, point_data.labels.size()}, point_data.labels.data());
         auto mask_tensor = infer(point_coords, point_labels);
 
+
         int batchSize = mask_tensor.get_shape()[0];
         int stride = mask_tensor.get_strides()[0];
 
         std::vector<cv::Mat> masks = {};
-        for (int i = 0; i < batchSize; i++) {
+        for (int i = 0; i < batchSize; i++) { // ???? no batch no need
             cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
-            new_mask.convertTo(new_mask, CV_8UC1, 255);
-            combineNewMask(masks, new_mask);
+            //cv::threshold(new_mask, new_mask, 0.5, 1, cv::THRESH_BINARY);
+            if (calculateStabilityScore(new_mask) > stability_threshold) {
+                new_mask.convertTo(new_mask, CV_8UC1, 255);
+                combineNewMask(masks, new_mask);
+            }
         }
 
+        if (masks.empty()) {
+            return {};
+        }
 
         return getContours(masks);
     }
 
-    Contours batchRunMask(std::vector<InteractivePoint> &points, int batchSize) {
-        std::vector<cv::Rect> boxes = {};
+    Contours batchRunMask(std::vector<InteractivePoint> &points, std::vector<cv::Rect> boxes, int batchSize) {
         std::vector<cv::Mat> masks = {};
-        for (size_t i = 0; i < points.size() / batchSize; i++ ) {
-            std::cout << "Batch " << i << "/" << points.size() / batchSize << std::endl;
-            std::vector<InteractivePoint> batch;
-            auto start = points.begin() + i * batchSize;
-            int endIndex = std::min<int>((i + 1) * batchSize, points.size());
 
-            auto end = points.begin() + endIndex;
-            batch.insert(batch.begin(), start, end);
-
-            auto point_data = buildPointCoords(batch, boxes, true);
+        auto batches = batchVector<InteractivePoint>(points, batchSize);
+        for (size_t i = 0; i < batches.size(); i++ ) {
+            std::cout << "Batch " << i << "/" << batches.size() << std::endl;
+            auto point_data = buildPointCoords(batches[i], boxes, true);
             ov::Tensor point_coords(ov::element::f32, ov::Shape{point_data.point_coords.size() / 2, 1, 2}, point_data.point_coords.data());
             ov::Tensor point_labels(ov::element::f32, ov::Shape{point_data.labels.size(), 1}, point_data.labels.data());
             auto mask_tensor = infer(point_coords, point_labels);
@@ -196,13 +191,15 @@ public:
 
             for (int i = 0; i < batchSize; i++) {
                 cv::Mat new_mask(1024, 1024, CV_32FC1, mask_tensor.data<float_t>() + (i * stride / sizeof(float_t)));
-                new_mask.convertTo(new_mask, CV_8UC1, 255);
-                combineNewMask(masks, new_mask);
+                if (calculateStabilityScore(new_mask) > stability_threshold) {
+                    new_mask.convertTo(new_mask, CV_8UC1, 255);
+                    combineNewMask(masks, new_mask);
+                }
             }
         }
-        return getContours(masks);
 
-        //return infer(point_coords, point_labels);
+        std::cout << "masks found: " << masks.size() << std::endl;
+        return getContours(masks);
     }
 
     ov::Tensor infer(ov::Tensor point_coords, ov::Tensor point_labels) {
@@ -215,6 +212,9 @@ public:
         result.outputsData = inferenceAdapter->infer(inputs);
         auto end = std::chrono::high_resolution_clock::now();
         std::cout << "time: " <<  std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()) << std::endl;
+
+        float* iou_predictions = result.outputsData["iou_predictions"].data<float_t>();
+        std::cout << iou_predictions[0] << std::endl;
 
         return result.outputsData["masks"];
     }
@@ -231,13 +231,16 @@ public:
                 return;
             }
         }
+        std::cout << "storing a mask..." << std::endl;
         saved_masks.push_back(mask);
     }
 
     std::vector<std::vector<cv::Point>> getContours(std::vector<cv::Mat> masks) {
-        std::vector<std::vector<cv::Point>> contours;
+        Contours contours;
         for (auto &mask: masks) {
-            contours.push_back(findBiggestContour(mask));
+            Contours newContours;
+            cv::findContours(mask, newContours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
+            contours.insert(contours.end(), newContours.begin(), newContours.end());
         }
 
         return contours;
@@ -257,6 +260,7 @@ cv::Point pointDown;
 cv::Point pointUp;
 
 bool PointMode = true;
+
 static void onMouse( int event, int x, int y, int, void* )
 {
     if (PointMode) {
@@ -279,6 +283,9 @@ static void onMouse( int event, int x, int y, int, void* )
         } else {
             pointUp = cv::Point(x, y);
 
+            points = {};
+            boxes = {};
+            boxes.emplace_back(pointDown, pointUp);
             drawContours(maskPredictor.runMask(points,boxes));
 
 
@@ -287,18 +294,27 @@ static void onMouse( int event, int x, int y, int, void* )
 }
 
 void segment_all() {
-    float n = 20;
+    float n = 40;
     cv::Point template_size(inputSize.width / n, inputSize.height / n);
 
     cv::Point grid_point;
     image.copyTo(outputImage);
     points = {};
-    for (grid_point.y = template_size.y / 2; grid_point.y < inputSize.height; grid_point.y += template_size.y){
-        for (grid_point.x = template_size.x / 2; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
-            points.emplace_back(grid_point.x, grid_point.y, true);
+    boxes = {};
+    if (PointMode) {
+        for (grid_point.y = template_size.y / 2; grid_point.y < inputSize.height; grid_point.y += template_size.y){
+            for (grid_point.x = template_size.x / 2; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
+                points.emplace_back(grid_point.x, grid_point.y, true);
+            }
+        }
+    } else {
+        for (grid_point.y = 0; grid_point.y < inputSize.height; grid_point.y += template_size.y){
+            for (grid_point.x = 0; grid_point.x < inputSize.width; grid_point.x += template_size.x) {
+                boxes.emplace_back(grid_point, grid_point + template_size);
+            }
         }
     }
-    auto contours = maskPredictor.batchRunMask(points, 20);
+    auto contours = maskPredictor.batchRunMask(points, boxes, 20);
     drawContours(contours);
 }
 
@@ -327,7 +343,6 @@ int main(int argc, char* argv[]) {
         cv::namedWindow( "image", 0);
         cv::imshow( "image", image);
         cv::setMouseCallback( "image", onMouse, 0 );
-
 
         maskPredictor = MaskPredictor("/data/sam/sam_mask_predictor.xml");
         segment_all();
