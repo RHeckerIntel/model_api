@@ -88,8 +88,10 @@ std::unique_ptr<ResultBase> InstanceSegmentationTiler::merge_results(const std::
 
     result->segmentedObjects.reserve(keep_idx.size());
     for (auto idx : keep_idx) {
-        all_detections_ptrs[idx].get().mask = segm_postprocess(all_detections_ptrs[idx], all_detections_ptrs[idx].get().mask,
-                                    image_size.height, image_size.width);
+        if (postprocess_semantic_masks) {
+            all_detections_ptrs[idx].get().mask = segm_postprocess(all_detections_ptrs[idx], all_detections_ptrs[idx].get().mask,
+                                        image_size.height, image_size.width);
+        }
         result->segmentedObjects.push_back(all_detections_ptrs[idx]);
     }
 
