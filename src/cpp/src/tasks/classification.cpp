@@ -197,6 +197,7 @@ Classification Classification::load(const std::string& model_path) {
 }
 
 ClassificationResult Classification::infer(cv::Mat image) {
+    std::cout << "infer start" << std::endl;
     return pipeline.infer(image);
 }
 
@@ -205,12 +206,21 @@ std::vector<ClassificationResult> Classification::inferBatch(std::vector<cv::Mat
 }
 
 std::map<std::string, ov::Tensor> Classification::preprocess(cv::Mat image) {
+    std::cout << "preprocess " << std::endl;
+    std::cout << "ptr: " << (!adapter ? "no adapter" : "yes adapter") << std::endl;
+    std::cout << adapter->getInputShape("data").size() << std::endl;
+    std::cout << "get input shape...." << std::endl;
+    std::cout << "n inputs: " << adapter->getInputNames().size() << std::endl;
+    for (auto& v: adapter->getInputNames()) {
+        std::cout << v << std::endl;
+    }
     std::map<std::string, ov::Tensor> input = {};
     input.emplace(adapter->getInputNames()[0], utils::wrapMat2Tensor(image));
     return input;
 }
 
 ClassificationResult Classification::postprocess(InferenceResult& infResult) {
+    std::cout << "postprocess " << std::endl;
     ClassificationResult result;
     if (multilabel) {
         result = get_multilabel_predictions(infResult, output_raw_scores);

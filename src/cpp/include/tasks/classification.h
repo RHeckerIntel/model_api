@@ -30,6 +30,12 @@ public:
             });
 
         auto config = adapter->getModelConfig();
+        std::cout << "wat..." << std::endl;
+        for (auto& v: adapter->getInputNames()) {
+            std::cout << v << std::endl;
+        }
+
+        std::cout << "..." << std::endl;
         labels = utils::get_from_any_maps("labels", config, {}, labels);
 
         topk = utils::get_from_any_maps("topk", config, {}, topk);

@@ -129,7 +129,9 @@ ov::PartialShape OpenVINOInferenceAdapter::getOutputShape(const std::string& out
 }
 
 void OpenVINOInferenceAdapter::initInputsOutputs() {
+    std::cout << "init inputs outputs" << std::endl;
     for (const auto& input : compiledModel.inputs()) {
+        std::cout << "input: " <<  input.get_any_name() << std::endl;
         inputNames.push_back(input.get_any_name());
     }
 
